@@ -4,6 +4,8 @@ und schreibt data/latest.json (vollstaendig) und data/latest.md (kompakt).
 Nur Standardbibliothek, laeuft in GitHub Actions."""
 import json
 import statistics
+import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -38,12 +40,29 @@ TZ = "Europe/Rome"
 UA = {"User-Agent": "sardinien-wetter (GitHub Actions; private trip planning)"}
 
 
+ERRORS = []
+
+
 def get(url, params):
     q = urllib.parse.urlencode(params, safe=",")
     req = urllib.request.Request(f"{url}?{q}", headers=UA)
-    with urllib.request.urlopen(req, timeout=90) as r:
-        data = json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"{url} HTTP {e.code}: {e.read().decode()[:300]}")
     return data if isinstance(data, list) else [data]
+
+
+def safe(label, fn, n):
+    try:
+        res = fn()
+        if len(res) != n:
+            raise RuntimeError(f"{len(res)} statt {n} Orte")
+        return res
+    except Exception as e:
+        ERRORS.append(f"{label}: {e}")
+        return [None] * n
 
 
 def compass(deg):
@@ -63,34 +82,35 @@ def main():
     lon = ",".join(str(p[3]) for p in POINTS)
     base = {"latitude": lat, "longitude": lon, "timezone": TZ, "forecast_days": DAYS}
 
-    mix = get("https://api.open-meteo.com/v1/forecast", {**base, "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_gusts_10m_max,wind_direction_10m_dominant,sunshine_duration"})
+    mix = safe("mix", lambda: get("https://api.open-meteo.com/v1/forecast", {**base, "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_gusts_10m_max,wind_direction_10m_dominant,sunshine_duration"}), len(POINTS))
     models = ["ecmwf_ifs025", "icon_seamless", "gfs_seamless", "ukmo_seamless"]
-    mm = get("https://api.open-meteo.com/v1/forecast", {**base, "daily": "precipitation_sum,wind_gusts_10m_max", "models": ",".join(models)})
-    ens = get("https://ensemble-api.open-meteo.com/v1/ensemble", {**base, "daily": "precipitation_sum,wind_gusts_10m_max", "models": "ecmwf_ifs025"})
+    mm = safe("modelle", lambda: get("https://api.open-meteo.com/v1/forecast", {**base, "daily": "precipitation_sum,wind_gusts_10m_max", "models": ",".join(models)}), len(POINTS))
+    ens = safe("ensemble", lambda: get("https://ensemble-api.open-meteo.com/v1/ensemble", {**base, "daily": "precipitation_sum,wind_gusts_10m_max", "models": "ecmwf_ifs025"}), len(POINTS))
 
     sea = [p for p in POINTS if p[4] is not None]
     mbase = {"latitude": ",".join(str(p[4]) for p in sea), "longitude": ",".join(str(p[5]) for p in sea), "timezone": TZ, "forecast_days": DAYS, "daily": "wave_height_max"}
-    marine = get("https://marine-api.open-meteo.com/v1/marine", mbase)
-    try:
-        marine_ec = get("https://marine-api.open-meteo.com/v1/marine", {**mbase, "models": "ecmwf_wam025"})
-    except Exception:
-        marine_ec = [None] * len(sea)
+    marine = safe("wellen", lambda: get("https://marine-api.open-meteo.com/v1/marine", mbase), len(sea))
+    marine_ec = safe("wellen-ecmwf", lambda: get("https://marine-api.open-meteo.com/v1/marine", {**mbase, "models": "ecmwf_wam025"}), len(sea))
 
     out = {"generated_utc": datetime.now(timezone.utc).isoformat(timespec="minutes"), "source": "Open-Meteo (best match, ECMWF IFS, ICON, GFS, UKMO, ECMWF-Ensemble 51, Wellen Meteo-France + ECMWF WAM)", "points": []}
     si = 0
     for i, p in enumerate(POINTS):
-        d, m, e = mix[i]["daily"], mm[i]["daily"], ens[i]["daily"]
         w = we = None
         if p[4] is not None:
-            w = marine[si]["daily"]
-            we = marine_ec[si]["daily"] if marine_ec[si] else None
+            w = (marine[si] or {}).get("daily")
+            we = (marine_ec[si] or {}).get("daily")
             si += 1
+        if not mix[i]:
+            continue
+        d = mix[i]["daily"]
+        m = (mm[i] or {}).get("daily", {})
+        e = (ens[i] or {}).get("daily", {})
         pk = [k for k in e if k.startswith("precipitation_sum")]
         gk = [k for k in e if k.startswith("wind_gusts_10m_max")]
         days = []
         for j, t in enumerate(d["time"]):
-            P = [e[k][j] for k in pk if e[k][j] is not None]
-            G = [e[k][j] for k in gk if e[k][j] is not None]
+            P = [e[k][j] for k in pk if j < len(e[k]) and e[k][j] is not None]
+            G = [e[k][j] for k in gk if j < len(e[k]) and e[k][j] is not None]
             pct = lambda arr, f: round(100 * sum(1 for x in arr if f(x)) / len(arr)) if arr else None
             days.append({
                 "date": t,
@@ -103,17 +123,19 @@ def main():
                 "sun_h": rnd((d["sunshine_duration"][j] or 0) / 3600, 1),
                 "ens_p1": pct(P, lambda x: x >= 1), "ens_p5": pct(P, lambda x: x >= 5), "ens_p20": pct(P, lambda x: x >= 20),
                 "ens_gust_med": rnd(statistics.median(G)) if G else None, "ens_g60": pct(G, lambda x: x >= 60),
-                "wave": rnd(w["wave_height_max"][j], 1) if w else None,
+                "wave": rnd(w["wave_height_max"][j], 1) if w and j < len(w["wave_height_max"]) else None,
                 "wave_ecmwf": rnd(we["wave_height_max"][j], 1) if we and j < len(we["wave_height_max"]) else None,
             })
         out["points"].append({"name": p[0], "region": p[1], "lat": p[2], "lon": p[3], "sea": [p[4], p[5]] if p[4] else None, "days": days})
 
+    out["errors"] = ERRORS
     with open("data/latest.json", "w") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
 
     berlin = datetime.now(timezone.utc) + timedelta(hours=2)
     lines = [f"# Sardinien Wetter – Stand {berlin:%d.%m.%Y %H:%M} MESZ", "",
              "Quelle: " + out["source"], "",
+             ("FEHLER beim Abruf: " + " | ".join(ERRORS)) if ERRORS else "Abruf vollständig.", "",
              "Spalten: Datum | Tmax/Tmin °C | Regen mm Mix (ECMWF/ICON/GFS/UKMO) | Ensemble P>=1/5/20 mm % | Böen km/h Mix Richtung (ECMWF/ICON/GFS/UKMO) | Ens. Böen-Median, P>=60 % | Sonne h | Welle m (MF/ECMWF)", ""]
     for pt in out["points"]:
         lines.append(f"## {pt['name']} ({pt['region']})")
@@ -128,4 +150,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import os
+        os.makedirs("data", exist_ok=True)
+        with open("data/error.txt", "w") as f:
+            f.write(traceback.format_exc() + "\n" + "\n".join(ERRORS))
+        raise

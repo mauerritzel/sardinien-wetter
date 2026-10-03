@@ -17,6 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Open-Meteo abrufen
+        continue-on-error: true
         run: mkdir -p data && python fetch_weather.py
       - name: Speichern
         run: |

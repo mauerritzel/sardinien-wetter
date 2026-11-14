@@ -1,4 +1,4 @@
-# Sardinien Wetter – Stand 14.11.2026 12:41 MESZ
+# Sardinien Wetter – Stand 14.11.2026 20:18 MESZ
 
 Quelle: Open-Meteo (best match, ECMWF IFS, ICON, GFS, UKMO, ECMWF-Ensemble 51, Wellen Meteo-France + ECMWF WAM)
 
